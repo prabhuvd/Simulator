@@ -1,6 +1,6 @@
 
 
-# 🚗 FUCYTECH Instrument Cluster & ECU Simulator
+# 🚗  Instrument Cluster & ECU Simulator
 
 A Python-based automotive instrument cluster simulator designed for learning **CAN Bus Reverse Engineering** and **UDS (Unified Diagnostic Services)** protocols.
 
