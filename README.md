@@ -118,10 +118,15 @@ The simulator implements a UDS Server. You can query these IDs using Service `0x
 To manually request the VIN via the terminal while the simulator is running:
 
 ```bash
-# Request VIN (Service 22, DID F190)
-# -s 7E0 = Source (Request ID)
-# -d 7E8 = Destination (Response ID)
-echo "22 F1 90" | isotpsend -s 7E0 -d 7E8 vcan0 -p 0x00
+   #Read Boot Software ID (0xF180)
+   cansend vcan0 7E0#0322F18000000000
+
+   #Read ECU Serial (0xF18C)
+   cansend vcan0 7E0#0322F18C00000000
+
+   # Request VIN (Length 03, Service 22, DID F1 90)
+   cansend vcan0 7E0#0322F19000000000
+
 ```
 
 You should see the dashboard light up with a **"DIAG"** warning icon when this happens!
