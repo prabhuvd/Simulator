@@ -19,6 +19,7 @@ This tool acts as a modern vehicle's ECU and Dashboard, allowing you to "drive" 
 *   **ISO-TP Support:** Handles multi-frame messages (fragmentation) for long data like VINs.
 
 ---
+<img width="1210" height="636" alt="image" src="https://github.com/user-attachments/assets/f0ac0d91-62bc-4456-b59a-e069a3274fd3" />
 
 ## 🛠️ Installation
 
