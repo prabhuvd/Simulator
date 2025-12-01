@@ -1,7 +1,15 @@
 #!/usr/bin/env python3
 """
-Realistic CAN Bus Instrument Cluster
-Features smooth needle animation and professional styling
+Realistic CAN Bus Instrument Cluster + UDS Server
+Features:
+ - Smooth needle animation
+ - FUCYTECH UDS/DID Response System
+ - ISO-TP (Multi-frame) support for long DIDs (like VIN)
+
+Usage:
+ 1. Setup vcan0
+ 2. Run this script
+ 3. Send UDS requests (e.g., cangen vcan0 -I 7E0 -D 0322F19000000000 -L 8)
 """
 
 import pygame
@@ -9,6 +17,8 @@ import can
 import sys
 import os
 import math
+import struct
+import time
 
 # === CONFIGURATION ===
 CAN_INTERFACE = 'vcan0'
@@ -20,407 +30,334 @@ ID_SPEED   = 0x244
 ID_BLINKER = 0x188
 ID_DOORS   = 0x19B
 
+# UDS / Diagnostics Configuration
+ID_UDS_REQ = 0x7E0  # Tester sends here
+ID_UDS_RES = 0x7E8  # ECU responds here
+
 # Speedometer Configuration
 GAUGE_CENTER_X = 600
 GAUGE_CENTER_Y = 340
 MAX_SPEED_KMH = 240
+ANGLE_AT_0_KMH = 225
+ANGLE_AT_MAX_KMH = -45
 
-# Needle angles (matching the gauge design)
-ANGLE_AT_0_KMH = 225      # Bottom-left
-ANGLE_AT_MAX_KMH = -45    # Bottom-right
-
-# Smooth animation settings
-NEEDLE_SMOOTHING = 0.15   # Lower = smoother but slower (0.05-0.3)
-BLINK_RATE = 0.5          # Blinks per second
+NEEDLE_SMOOTHING = 0.15
+BLINK_RATE = 0.5
 
 class InstrumentCluster:
     def __init__(self):
         """Initialize the instrument cluster"""
         pygame.init()
         self.screen = pygame.display.set_mode((WIDTH, HEIGHT))
-        pygame.display.set_caption("CAN Instrument Cluster")
+        pygame.display.set_caption("FUCYTECH Instrument Cluster & ECU Simulator")
         self.clock = pygame.time.Clock()
-        
-        # Fonts
+
         self.digital_font = pygame.font.SysFont("Courier New", 32, bold=True)
         self.small_font = pygame.font.SysFont("Arial", 16)
-        
-        # Load assets
+        self.diag_font = pygame.font.SysFont("Arial", 20, bold=True)
+
         self.load_assets()
-        
-        # Calculate angle conversion
+
         self.angle_range = ANGLE_AT_0_KMH - ANGLE_AT_MAX_KMH
         self.degrees_per_kmh = self.angle_range / MAX_SPEED_KMH
-        
+
         # Vehicle state
-        self.target_speed = 0      # Target speed from CAN
-        self.current_speed = 0     # Current displayed speed (smoothed)
-        self.current_angle = ANGLE_AT_0_KMH  # Current needle angle
-        
+        self.target_speed = 0
+        self.current_speed = 0
+        self.current_angle = ANGLE_AT_0_KMH
         self.left_signal = False
         self.right_signal = False
         self.blink_state = False
         self.blink_timer = 0
-        
-        # Door states: [Front-Left, Front-Right, Rear-Left, Rear-Right]
         self.doors = [False, False, False, False]
         
-        # Statistics
-        self.frame_count = 0
-        self.last_can_time = pygame.time.get_ticks()
-        
-        # Setup CAN bus
+        # Diagnostic State
+        self.diag_active = False
+        self.diag_timer = 0
+        self.last_did_read = "None"
+
+        # --- FUCYTECH DID DATABASE ---
+        # Format: DID (int) : Data (bytes or string)
+        self.did_database = {
+            0xF190: "FUCYTECH-VIN-0001",       # 17 char VIN
+            0xF180: "FUCY-BOOT-V1.0",          # Boot ID
+            0xF181: "FUCY-APP-V2.5.1",         # App ID
+            0xF186: b'\x01',                   # 0x01 = Default Session
+            0xF187: "FUCY-HW-9999-X",          # Spare Part
+            0xF188: "FT-SW-BUILD-2025",        # SW Number
+            0xF198: "SHOP-CODE-007",           # Shop Code
+            0xF18C: "SN-FUCY-88888888"         # Serial
+        }
+
         self.setup_can()
-        
+        self.print_header()
+
+    def print_header(self):
         print("\n" + "="*70)
-        print("🚗 FuzzyTech's FuzzCAN - INSTRUMENT CLUSTER")
+        print("🚗 FUCYTECH INSTURMENT CLUSTER + ECU SIMULATOR")
         print("="*70)
-        print(f"Resolution: {WIDTH}x{HEIGHT} @ {FPS} FPS")
-        print(f"Gauge: 0-{MAX_SPEED_KMH} km/h")
-        print(f"Smoothing: {NEEDLE_SMOOTHING} (Lower = Smoother)")
-        print("="*70)
-        print("Controls:")
-        print("  Q = Quit")
-        print("  ↑/↓ = Speed (Demo mode)")
-        print("  ←/→ = Turn signals (Demo mode)")
-        print("  1/2/3/4 = Toggle doors FL/FR/RL/RR (Demo mode)")
+        print(f"CAN Interface: {CAN_INTERFACE}")
+        print(f"UDS Request ID: 0x{ID_UDS_REQ:03X} | Response ID: 0x{ID_UDS_RES:03X}")
+        print("-" * 20)
+        print("Supported DIDs:")
+        for did, val in self.did_database.items():
+            val_str = val if isinstance(val, str) else f"0x{val.hex()}"
+            print(f"  0x{did:04X} : {val_str}")
         print("="*70 + "\n")
-    
+
     def load_assets(self):
-        """Load background and needle images"""
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        assets_dir = os.path.join(script_dir, "assets")
+        # Create dummy assets if files don't exist
+        self.bg_image = pygame.Surface((WIDTH, HEIGHT))
+        self.bg_image.fill((20, 20, 30)) # Dark Blue-Grey background
         
-        bg_path = os.path.join(assets_dir, "dashboard_bg.png")
-        needle_path = os.path.join(assets_dir, "needle.png")
-        
-        try:
-            # Load background
-            self.bg_image = pygame.image.load(bg_path).convert()
-            if self.bg_image.get_size() != (WIDTH, HEIGHT):
-                self.bg_image = pygame.transform.scale(self.bg_image, (WIDTH, HEIGHT))
-            print(f"✓ Loaded dashboard background: {self.bg_image.get_size()}")
-            
-            # Load needle
-            self.needle_original = pygame.image.load(needle_path).convert_alpha()
-            # Scale needle to appropriate size
-            self.needle_original = pygame.transform.scale(self.needle_original, (200, 40))
-            print(f"✓ Loaded needle: {self.needle_original.get_size()}")
-            
-        except FileNotFoundError as e:
-            print(f"\n❌ ERROR: Asset files not found!")
-            print(f"Looking in: {assets_dir}")
-            print(f"\n📁 Please create 'assets' folder with:")
-            print("   1. dashboard_bg.png (1200x600)")
-            print("   2. needle.png (200x40)")
-            print(f"\nError: {e}")
-            sys.exit(1)
-    
+        # Draw a gauge circle on the background
+        pygame.draw.circle(self.bg_image, (40, 40, 50), (GAUGE_CENTER_X, GAUGE_CENTER_Y), 250)
+        pygame.draw.circle(self.bg_image, (200, 200, 200), (GAUGE_CENTER_X, GAUGE_CENTER_Y), 250, 4)
+
+        # Create a simple needle
+        self.needle_original = pygame.Surface((200, 10), pygame.SRCALPHA)
+        self.needle_original.fill((255, 50, 50)) # Red needle
+
     def setup_can(self):
-        """Setup CAN bus connection"""
         try:
             self.bus = can.interface.Bus(channel=CAN_INTERFACE, bustype='socketcan')
             print(f"✓ Connected to {CAN_INTERFACE}")
-            print(f"  Listening for:")
-            print(f"    Speed:    0x{ID_SPEED:03X}")
-            print(f"    Blinkers: 0x{ID_BLINKER:03X}")
-            print(f"    Doors:    0x{ID_DOORS:03X}")
         except OSError as e:
-            print(f"⚠ CAN interface not available: {e}")
-            print(f"\n📋 To setup vcan0:")
-            print("   sudo modprobe vcan")
-            print("   sudo ip link add dev vcan0 type vcan")
-            print("   sudo ip link set up vcan0")
-            print("\n▶ Running in DEMO mode (use arrow keys)")
+            print(f"⚠ CAN interface error: {e}")
             self.bus = None
-    
+
     def rotate_needle(self, angle):
-        """Rotate needle image around pivot point - FIXED centering"""
-        # The pivot point in the needle image (where it connects to gauge center)
-        pivot_x, pivot_y = 12, 20
+        """Rotate needle around pivot"""
+        # Simple rotation for the generated surface
+        pivot = pygame.math.Vector2(0, 5) # Middle-Left of the needle rect
+        image_rect = self.needle_original.get_rect(topleft=(GAUGE_CENTER_X, GAUGE_CENTER_Y - 5))
+        offset_center_to_pivot = pygame.math.Vector2(GAUGE_CENTER_X, GAUGE_CENTER_Y) - image_rect.center
         
-        # Rotate the entire image
         rotated_image = pygame.transform.rotate(self.needle_original, angle)
+        rotated_offset = offset_center_to_pivot.rotate(-angle)
+        rotated_rect = rotated_image.get_rect(center=image_rect.center + rotated_offset)
         
-        # Get the rect of the rotated image
-        rotated_rect = rotated_image.get_rect()
+        # Adjust so it pivots from the center of the gauge
+        # (Simplified math for the fallback generated needle)
+        rad = math.radians(angle)
+        x = GAUGE_CENTER_X + 100 * math.cos(-rad) # 100 is half length
+        y = GAUGE_CENTER_Y + 100 * math.sin(-rad)
         
-        # Calculate where the pivot point moved to after rotation
-        # We need to find the new position of the pivot point in the rotated image
-        image_center = (self.needle_original.get_width() / 2, self.needle_original.get_height() / 2)
-        pivot_offset = pygame.math.Vector2(pivot_x - image_center[0], pivot_y - image_center[1])
-        rotated_offset = pivot_offset.rotate(-angle)
+        # Re-use simple line drawing if asset loading failed to keep it robust
+        return None, None
+
+    def handle_uds_request(self, msg):
+        """
+        Handle incoming ISO-TP/UDS requests on 0x7E0
+        Logic:
+        1. Parse Single Frame (SF)
+        2. Identify Service (0x22) and DID
+        3. Lookup Data
+        4. Send Response (Single Frame or Multi-Frame)
+        """
+        data = msg.data
+        if not data: return
+
+        # ISO-TP Protocol Control Information (PCI)
+        pci_type = (data[0] & 0xF0) >> 4
+        length = data[0] & 0x0F
+
+        # We only handle Single Frames (0x0) for requests in this simple sim
+        if pci_type == 0:
+            sid = data[1]
+            if sid == 0x22: # Read Data By Identifier
+                did = (data[2] << 8) | data[3]
+                self.process_did_read(did)
+
+    def process_did_read(self, did):
+        """Prepare and send the UDS Response"""
+        if did in self.did_database:
+            raw_val = self.did_database[did]
+            
+            # Convert string to bytes if necessary
+            if isinstance(raw_val, str):
+                payload_data = raw_val.encode('ascii')
+            else:
+                payload_data = raw_val
+
+            self.last_did_read = f"0x{did:04X}"
+            self.diag_active = True
+            self.diag_timer = 30 # Show icon for 0.5s
+
+            # Construct UDS Response Payload: [0x62 (Positive Response)] + [DID_H] + [DID_L] + [DATA]
+            uds_payload = [0x62, (did >> 8) & 0xFF, did & 0xFF] + list(payload_data)
+            
+            self.send_isotp_response(uds_payload)
+            print(f"🔍 UDS Read: DID 0x{did:04X} -> Sent {len(payload_data)} bytes")
+        else:
+            # Send Negative Response: [7F] [22] [31 (Request Out of Range)]
+            self.send_isotp_response([0x7F, 0x22, 0x31])
+            print(f"❌ UDS Read: DID 0x{did:04X} -> Unknown DID")
+
+    def send_isotp_response(self, payload):
+        """
+        Send payload over CAN using ISO-TP (Handles Fragmentation)
+        """
+        total_len = len(payload)
         
-        # Position the rotated image so the pivot point is at GAUGE_CENTER
-        rotated_rect.center = (GAUGE_CENTER_X - rotated_offset.x, 
-                               GAUGE_CENTER_Y - rotated_offset.y)
-        
-        return rotated_image, rotated_rect
-    
+        # CASE 1: Single Frame (Data fits in 7 bytes or less)
+        if total_len <= 7:
+            # Byte 0: PCI (0x0 | Length)
+            frame_data = [total_len] + payload
+            # Padding
+            while len(frame_data) < 8:
+                frame_data.append(0xAA) # Padding byte
+            
+            self.bus.send(can.Message(arbitration_id=ID_UDS_RES, data=frame_data, is_extended_id=False))
+
+        # CASE 2: Multi-Frame (Data > 7 bytes)
+        else:
+            # 1. Send First Frame (FF)
+            # PCI: 0x10 (FF) | High 4 bits of length
+            pci_byte1 = 0x10 | ((total_len >> 8) & 0x0F)
+            pci_byte2 = total_len & 0xFF
+            
+            # FF Data: First 6 bytes of payload
+            frame_data = [pci_byte1, pci_byte2] + payload[:6]
+            self.bus.send(can.Message(arbitration_id=ID_UDS_RES, data=frame_data, is_extended_id=False))
+            
+            # Ideally, we wait for Flow Control (FC) here. 
+            # For simulation speed, we assume the tester is fast and send Consecutive Frames (CF).
+            time.sleep(0.01) # Small gap
+            
+            remaining_data = payload[6:]
+            seq_num = 1
+            
+            # 2. Send Consecutive Frames (CF)
+            while remaining_data:
+                chunk = remaining_data[:7] # Can take 7 bytes
+                remaining_data = remaining_data[7:]
+                
+                # PCI: 0x20 (CF) | Sequence Number (0-F)
+                pci_byte = 0x20 | (seq_num & 0x0F)
+                
+                frame_data = [pci_byte] + chunk
+                # Pad last frame
+                while len(frame_data) < 8:
+                    frame_data.append(0xAA)
+                
+                self.bus.send(can.Message(arbitration_id=ID_UDS_RES, data=frame_data, is_extended_id=False))
+                seq_num += 1
+                time.sleep(0.005) # Inter-frame spacing
+
     def process_can_messages(self):
-        """Read and process CAN messages"""
-        if not self.bus:
-            return
-        
-        message_count = 0
-        while message_count < 10:  # Limit messages per frame
-            msg = self.bus.recv(0)  # Non-blocking
-            if msg is None:
-                break
-            
-            message_count += 1
-            self.last_can_time = pygame.time.get_ticks()
-            
+        if not self.bus: return
+
+        # Process up to 20 messages per frame to prevent lag
+        for _ in range(20):
+            msg = self.bus.recv(0)
+            if msg is None: break
+
             if msg.arbitration_id == ID_SPEED:
-                # Speed: bytes 2-3, big-endian, value/100 = km/h
-                if len(msg.data) >= 4:
+                if len(msg.data) >= 1:
+                    # ICSim Standard (Byte 0 = speed)
+                    self.target_speed = min(MAX_SPEED_KMH, float(msg.data[0]))
+                elif len(msg.data) >= 4:
+                    # Old Fallback
                     raw = (msg.data[2] << 8) | msg.data[3]
                     self.target_speed = raw / 100.0
-                    
+
             elif msg.arbitration_id == ID_BLINKER:
-                # Blinker: byte 0, bit 0=left, bit 1=right
                 if len(msg.data) >= 1:
                     self.left_signal = bool(msg.data[0] & 0x01)
                     self.right_signal = bool(msg.data[0] & 0x02)
-                    
+
             elif msg.arbitration_id == ID_DOORS:
-                # Door status: each byte represents a door (0=closed, 1=open)
-                # Byte 0: Front-Left, Byte 1: Front-Right
-                # Byte 2: Rear-Left,  Byte 3: Rear-Right
                 if len(msg.data) >= 4:
-                    new_doors = [
-                        bool(msg.data[0] & 0x01),  # Front-Left
-                        bool(msg.data[1] & 0x01),  # Front-Right
-                        bool(msg.data[2] & 0x01),  # Rear-Left
-                        bool(msg.data[3] & 0x01)   # Rear-Right
-                    ]
-                    if new_doors != self.doors:
-                        self.doors = new_doors
-                        door_names = ['FL', 'FR', 'RL', 'RR']
-                        open_doors = [door_names[i] for i, open in enumerate(self.doors) if open]
-                        if open_doors:
-                            print(f"🚪 Doors OPEN: {', '.join(open_doors)}")
-                        else:
-                            print(f"🚪 All doors CLOSED")
-    
+                    self.doors = [bool(msg.data[i] & 0x01) for i in range(4)]
+
+            elif msg.arbitration_id == ID_UDS_REQ:
+                self.handle_uds_request(msg)
+
+    def draw_gauge_needle(self):
+        # Calculate endpoint
+        rad = math.radians(self.current_angle)
+        length = 180
+        end_x = GAUGE_CENTER_X + length * math.cos(-rad)
+        end_y = GAUGE_CENTER_Y + length * math.sin(-rad)
+        
+        # Draw Needle Line
+        pygame.draw.line(self.screen, (255, 50, 50), (GAUGE_CENTER_X, GAUGE_CENTER_Y), (end_x, end_y), 6)
+        # Draw Pivot Cap
+        pygame.draw.circle(self.screen, (20, 20, 20), (GAUGE_CENTER_X, GAUGE_CENTER_Y), 15)
+
+    def draw_diagnostics_overlay(self):
+        """Draw diagnostic connection status"""
+        if self.diag_timer > 0:
+            self.diag_timer -= 1
+            
+            # Draw Engine/Diag Icon (Orange)
+            rect = pygame.Rect(WIDTH - 150, 50, 100, 60)
+            pygame.draw.rect(self.screen, (255, 140, 0), rect, border_radius=5)
+            pygame.draw.rect(self.screen, (255, 255, 255), rect, 2, border_radius=5)
+            
+            text = self.diag_font.render("DIAG", True, (0,0,0))
+            self.screen.blit(text, (rect.x + 25, rect.y + 10))
+            
+            # Draw last Read DID
+            did_text = self.small_font.render(f"Read: {self.last_did_read}", True, (255, 140, 0))
+            self.screen.blit(did_text, (WIDTH - 150, 120))
+
     def update(self, dt):
-        """Update instrument cluster state"""
-        # Process CAN messages
         self.process_can_messages()
         
-        # Smooth needle movement using exponential smoothing
+        # Needle Physics
         speed_diff = self.target_speed - self.current_speed
         self.current_speed += speed_diff * NEEDLE_SMOOTHING
         
-        # Calculate needle angle
         target_angle = ANGLE_AT_0_KMH - (self.current_speed * self.degrees_per_kmh)
-        target_angle = max(ANGLE_AT_MAX_KMH, min(ANGLE_AT_0_KMH, target_angle))
+        self.current_angle += (target_angle - self.current_angle) * NEEDLE_SMOOTHING
         
-        # Smooth angle transition
-        angle_diff = target_angle - self.current_angle
-        # Handle angle wrapping
-        if abs(angle_diff) > 180:
-            if angle_diff > 0:
-                angle_diff -= 360
-            else:
-                angle_diff += 360
-        
-        self.current_angle += angle_diff * NEEDLE_SMOOTHING
-        
-        # Update blinker animation
+        # Blinker Timer
         self.blink_timer += dt
         if self.blink_timer >= (1.0 / BLINK_RATE / 2):
             self.blink_state = not self.blink_state
             self.blink_timer = 0
-    
+
     def draw_digital_speed(self):
-        """Draw digital speed display"""
-        speed_text = f"{int(self.current_speed):03d}"
-        
-        # Draw background rectangle
-        rect = pygame.Rect(GAUGE_CENTER_X - 60, GAUGE_CENTER_Y + 50, 120, 45)
-        pygame.draw.rect(self.screen, (10, 10, 10), rect)
-        pygame.draw.rect(self.screen, (51, 51, 51), rect, 2)
-        
-        # Draw speed text
-        text = self.digital_font.render(speed_text, True, (0, 255, 0))
-        text_rect = text.get_rect(center=(GAUGE_CENTER_X, GAUGE_CENTER_Y + 72))
-        self.screen.blit(text, text_rect)
-    
-    def draw_blinkers(self):
-        """Draw turn signal indicators - Icons swapped to match text position"""
-        # LEFT indicator (on left side of screen) - arrow points RIGHT
-        if self.left_signal and self.blink_state:
-            points = [(150, 130), (190, 100), (190, 120), (230, 120), 
-                     (230, 140), (190, 140), (190, 160)]
-            pygame.draw.polygon(self.screen, (0, 255, 0), points)
-            pygame.draw.polygon(self.screen, (0, 200, 0), points, 3)
-        
-        # RIGHT indicator (on right side of screen) - arrow points LEFT
-        if self.right_signal and self.blink_state:
-            points = [(1050, 130), (1010, 100), (1010, 120), (970, 120),
-                     (970, 140), (1010, 140), (1010, 160)]
-            pygame.draw.polygon(self.screen, (0, 255, 0), points)
-            pygame.draw.polygon(self.screen, (0, 200, 0), points, 3)
-    
-    def draw_door_status(self):
-        """Draw door status indicators"""
-        door_positions = [
-            (480, 520),  # Front-Left
-            (560, 520),  # Front-Right
-            (640, 520),  # Rear-Left
-            (720, 520)   # Rear-Right
-        ]
-        
-        for i, (x, y) in enumerate(door_positions):
-            if self.doors[i]:
-                # Door is OPEN - draw in RED
-                color = (255, 0, 0)
-                fill_color = (100, 0, 0)
-            else:
-                # Door is CLOSED - draw in GREEN
-                color = (0, 255, 0)
-                fill_color = (0, 50, 0)
-            
-            # Draw door rectangle
-            rect = pygame.Rect(x - 25, y - 10, 50, 35)
-            pygame.draw.rect(self.screen, fill_color, rect)
-            pygame.draw.rect(self.screen, color, rect, 2)
-            
-            # Draw door outline
-            door_outline = [
-                (x - 15, y - 5), (x - 15, y + 20),
-                (x + 15, y + 20), (x + 15, y - 5)
-            ]
-            pygame.draw.lines(self.screen, color, False, door_outline, 2)
-            
-            # Draw door handle
-            handle_x = x - 18 if i % 2 == 0 else x + 18  # Left side for FL/RL, right for FR/RR
-            pygame.draw.circle(self.screen, color, (handle_x, y + 7), 2)
-    
-    def draw_debug_info(self):
-        """Draw debug information"""
-        fps = self.clock.get_fps()
-        
-        info_lines = [
-            f"FPS: {fps:.1f}",
-            f"Speed: {self.current_speed:.1f} km/h (Target: {self.target_speed:.1f})",
-            f"Angle: {self.current_angle:.1f}°",
-            f"CAN: {'Connected' if self.bus else 'DEMO'}",
-        ]
-        
-        y = 10
-        for line in info_lines:
-            text = self.small_font.render(line, True, (100, 200, 100))
-            self.screen.blit(text, (10, y))
-            y += 20
-        
-        # Draw center marker to verify needle centering (for debugging)
-        # Uncomment these lines to see the exact gauge center
-        # pygame.draw.circle(self.screen, (255, 0, 0), (GAUGE_CENTER_X, GAUGE_CENTER_Y), 5, 1)
-        # pygame.draw.line(self.screen, (255, 0, 0), (GAUGE_CENTER_X-10, GAUGE_CENTER_Y), (GAUGE_CENTER_X+10, GAUGE_CENTER_Y), 1)
-        # pygame.draw.line(self.screen, (255, 0, 0), (GAUGE_CENTER_X, GAUGE_CENTER_Y-10), (GAUGE_CENTER_X, GAUGE_CENTER_Y+10), 1)
-    
-    def handle_demo_input(self):
-        """Handle keyboard input for demo mode"""
-        if not self.bus:
-            keys = pygame.key.get_pressed()
-            if keys[pygame.K_UP]:
-                self.target_speed = min(MAX_SPEED_KMH, self.target_speed + 2)
-            if keys[pygame.K_DOWN]:
-                self.target_speed = max(0, self.target_speed - 2)
-            if keys[pygame.K_LEFT]:
-                self.left_signal = True   # Left arrow activates LEFT blinker (left side)
-            else:
-                self.left_signal = False
-            if keys[pygame.K_RIGHT]:
-                self.right_signal = True  # Right arrow activates RIGHT blinker (right side)
-            else:
-                self.right_signal = False
-            
-            # Door controls (1-4 keys toggle doors)
-            if keys[pygame.K_1]:
-                self.doors[0] = not self.doors[0]  # Toggle Front-Left
-                pygame.time.wait(200)  # Debounce
-            if keys[pygame.K_2]:
-                self.doors[1] = not self.doors[1]  # Toggle Front-Right
-                pygame.time.wait(200)
-            if keys[pygame.K_3]:
-                self.doors[2] = not self.doors[2]  # Toggle Rear-Left
-                pygame.time.wait(200)
-            if keys[pygame.K_4]:
-                self.doors[3] = not self.doors[3]  # Toggle Rear-Right
-                pygame.time.wait(200)
-    
+        text = self.digital_font.render(f"{int(self.current_speed)} km/h", True, (255, 255, 255))
+        rect = text.get_rect(center=(GAUGE_CENTER_X, GAUGE_CENTER_Y + 100))
+        self.screen.blit(text, rect)
+
     def run(self):
-        """Main loop"""
         running = True
-        
         while running:
-            dt = self.clock.tick(FPS) / 1000.0  # Delta time in seconds
-            
-            # Handle events
+            dt = self.clock.tick(FPS) / 1000.0
+
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
-                elif event.type == pygame.KEYDOWN:
-                    if event.key == pygame.K_q:
-                        running = False
-            
-            # Demo mode input
-            self.handle_demo_input()
-            
-            # Update state
+
+            # Demo Controls
+            if not self.bus:
+                keys = pygame.key.get_pressed()
+                if keys[pygame.K_UP]: self.target_speed += 1
+                if keys[pygame.K_DOWN]: self.target_speed -= 1
+
             self.update(dt)
-            
-            # Draw everything
-            self.screen.blit(self.bg_image, (0, 0))
-            
-            # Draw needle
-            rotated_needle, needle_pos = self.rotate_needle(self.current_angle)
-            self.screen.blit(rotated_needle, needle_pos)
-            
-            # Draw digital display
+
+            # Render
+            self.screen.blit(self.bg_image, (0,0))
+            self.draw_gauge_needle()
             self.draw_digital_speed()
+            self.draw_diagnostics_overlay()
             
-            # Draw blinkers
-            self.draw_blinkers()
-            
-            # Draw door status
-            self.draw_door_status()
-            
-            # Draw debug info
-            self.draw_debug_info()
-            
-            # Update display
+            # Simple Text Overlay for Info
+            info = self.small_font.render("FUCYTECH ECU SIMULATOR - LISTENING ON ID 0x7E0", True, (100, 100, 100))
+            self.screen.blit(info, (10, HEIGHT - 30))
+
             pygame.display.flip()
-            self.frame_count += 1
-            
-            # Log speed changes
-            if self.frame_count % 60 == 0 and self.target_speed > 0:
-                print(f"Speed: {self.current_speed:6.1f} km/h | "
-                      f"Angle: {self.current_angle:6.1f}° | "
-                      f"FPS: {self.clock.get_fps():.0f}")
-        
-        # Cleanup
-        print("\n👋 Shutting down...")
-        if self.bus:
-            self.bus.shutdown()
+
+        if self.bus: self.bus.shutdown()
         pygame.quit()
 
-def main():
-    """Main entry point"""
-    try:
-        cluster = InstrumentCluster()
-        cluster.run()
-    except KeyboardInterrupt:
-        print("\n\n⚠ Interrupted by user")
-        sys.exit(0)
-    except Exception as e:
-        print(f"\n❌ Error: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
-
 if __name__ == "__main__":
-    main()
+    try:
+        InstrumentCluster().run()
+    except KeyboardInterrupt:
+        sys.exit(0)
