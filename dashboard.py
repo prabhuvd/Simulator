@@ -311,11 +311,22 @@ class InstrumentCluster:
                     self.right_signal = bool(msg.data[0] & 0x02)
 
             elif msg.arbitration_id == ID_DOORS:
-                if len(msg.data) >= 4:
-                    self.doors = [
-                        bool(msg.data[0] & 0x01), bool(msg.data[1] & 0x01),
-                        bool(msg.data[2] & 0x01), bool(msg.data[3] & 0x01)
-                    ]
+                # Check each byte independently to allow variable length messages
+                # Byte 0: Front-Left
+                if len(msg.data) > 0:
+                    self.doors[0] = bool(msg.data[0] & 0x01)
+                
+                # Byte 1: Front-Right
+                if len(msg.data) > 1:
+                    self.doors[1] = bool(msg.data[1] & 0x01)
+                
+                # Byte 2: Rear-Left
+                if len(msg.data) > 2:
+                    self.doors[2] = bool(msg.data[2] & 0x01)
+                
+                # Byte 3: Rear-Right
+                if len(msg.data) > 3:
+                    self.doors[3] = bool(msg.data[3] & 0x01)
             
             # --- Diagnostic Request ---
             elif msg.arbitration_id == ID_UDS_REQ:
